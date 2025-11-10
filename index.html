@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Noise Monitor + Live Transcript</title>
+  <style>
+    body{font-family:Arial, sans-serif;background:#f7f7f7;padding:30px}
+    .container{max-width:640px;margin:auto;background:#fff;padding:20px 30px;border-radius:12px;box-shadow:0 6px 14px rgba(0,0,0,.1)}
+    .status{font-size:18px;margin-top:12px;padding:8px 14px;border-radius:8px;font-weight:600;text-align:center}
+    .ok{background:#e7f9e7;color:#2f9e44}.warning{background:#ffe3e3;color:#c92a2a}
+    .row{display:flex;align-items:baseline;gap:12px}
+    .value-big{font-size:42px;font-weight:800;margin:6px 0}
+    .subtle{color:#666;font-size:13px}
+    .bar{width:100%;height:10px;background:#eee;border-radius:999px;overflow:hidden;margin-top:10px}
+    .bar>div{height:100%;width:0%;background:linear-gradient(90deg,#7dd3fc,#60a5fa,#22c55e,#f59e0b,#ef4444);transition:width 120ms linear}
+    button{padding:10px 14px;font-size:15px;cursor:pointer;border:none;background:#0052cc;color:#fff;border-radius:8px}
+    button:disabled{background:#999}
+    .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .section{margin-top:24px}
+    .card{background:#fafafa;border:1px solid #eee;border-radius:10px;padding:12px}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+    .transcript{min-height:120px;white-space:pre-wrap}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef;color:#334}
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>📢 Background Noise Monitor</h2>
+
+  <!-- Noise UI -->
+  <div class="row">
+    <div>
+      <div class="subtle">Loudness (0–100)</div>
+      <div id="loudness" class="value-big">0</div>
+      <div class="subtle" id="dbRaw">dBFS: –</div>
+    </div>
+  </div>
+  <div class="bar"><div id="barFill"></div></div>
+  <div id="statusBox" class="status ok">✅ OK</div>
+
+  <div class="btns">
+    <button id="btnStart">Start Noise Monitor</button>
+    <button id="btnStop" disabled>Stop Noise Monitor</button>
+  </div>
+
+  <!-- STT UI -->
+  <div class="section">
+    <h3>🗣️ Live Speech-to-Text</h3>
+    <div class="card">
+      <div class="subtle">Status: <span id="sttStatus" class="pill">idle</span></div>
+      <div class="btns">
+        <button id="btnSttStart">Start Speech</button>
+        <button id="btnSttStop" disabled>Stop Speech</button>
+      </div>
+      <div class="subtle" style="margin-top:10px">Live (interim):</div>
+      <div id="sttInterim" class="mono transcript"></div>
+      <div class="subtle" style="margin-top:10px">Final transcript (saved):</div>
+      <div id="sttFinal" class="mono transcript"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===================== Noise Monitor (existing) ===================== */
+let ws, audioCtx, processor, source;
+
+document.getElementById("btnStart").onclick = startMonitoring;
+document.getElementById("btnStop").onclick = stopMonitoring;
+
+function mapDbfsToLoudness(db){
+  const clamped = Math.max(-100, Math.min(0, Number(db)||0));
+  return Math.round(100 + clamped);
+}
+
+async function startMonitoring(){
+  try{
+    document.getElementById("btnStart").disabled = true;
+
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const host = location.hostname;
+    const WS_URL = `${proto}://${host}:8000/ws/monitor`;
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = ()=>{
+      console.log("WS connected:", WS_URL);
+      document.getElementById("btnStop").disabled = false;
+    };
+    ws.onerror = (e)=>console.error("WS error", e);
+    ws.onclose = (e)=>console.warn("WS closed", e.code, e.reason);
+
+    ws.onmessage = (event)=>{
+      const data = JSON.parse(event.data);
+      const db = Number(data.db);
+      const loud = mapDbfsToLoudness(db);
+      document.getElementById("loudness").textContent = `${loud}`;
+      document.getElementById("dbRaw").textContent = `dBFS: ${db.toFixed(2)}`;
+      document.getElementById("barFill").style.width = `${loud}%`;
+
+      const statusBox = document.getElementById("statusBox");
+      if (data.state === "warning"){
+        statusBox.className = "status warning";
+        statusBox.textContent = "⚠️ WARNING!";
+      } else {
+        statusBox.className = "status ok";
+        statusBox.textContent = "✅ OK";
+      }
+    };
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    audioCtx = new AudioContext({ sampleRate:16000 });
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(4096,1,1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    processor.onaudioprocess = (e)=>{
+      if (!ws || ws.readyState !== 1) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const buf = new ArrayBuffer(input.length * 2);
+      const view = new DataView(buf);
+      for (let i=0;i<input.length;i++){
+        let s = Math.max(-1, Math.min(1, input[i]));
+        view.setInt16(i*2, s<0 ? s*0x8000 : s*0x7FFF, true);
+      }
+      ws.send(buf);
+    };
+  }catch(err){
+    alert("Noise monitor error: "+err.message);
+    document.getElementById("btnStart").disabled = false;
+  }
+}
+
+function stopMonitoring(){
+  if (ws) ws.close();
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (audioCtx) audioCtx.close();
+  document.getElementById("btnStart").disabled = false;
+  document.getElementById("btnStop").disabled = true;
+}
+
+/* ===================== Browser STT (Web Speech API) ===================== */
+let rec;           // recognition instance
+let sttRunning=false;
+let finalText="";
+
+const sttStatusEl = document.getElementById("sttStatus");
+const sttInterimEl = document.getElementById("sttInterim");
+const sttFinalEl = document.getElementById("sttFinal");
+
+document.getElementById("btnSttStart").onclick = startSTT;
+document.getElementById("btnSttStop").onclick = stopSTT;
+
+function updateSttStatus(text){ sttStatusEl.textContent = text; }
+
+function startSTT(){
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition){
+    alert("Your browser doesn't support SpeechRecognition. Use Chrome/Edge or choose server-side STT.");
+    return;
+  }
+  rec = new SpeechRecognition();
+  rec.lang = "en-IN";          // set your language (e.g., "en-US", "hi-IN")
+  rec.continuous = true;       // keep listening
+  rec.interimResults = true;   // get interim text quickly
+
+  finalText = "";
+  sttFinalEl.textContent = "";
+  sttInterimEl.textContent = "";
+
+  rec.onstart = ()=>{
+    sttRunning = true;
+    updateSttStatus("listening…");
+    document.getElementById("btnSttStart").disabled = true;
+    document.getElementById("btnSttStop").disabled = false;
+  };
+
+  rec.onresult = (event)=>{
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++){
+      const res = event.results[i];
+      if (res.isFinal){
+        // append finalized sentence
+        finalText += (finalText ? " " : "") + res[0].transcript.trim();
+        sttFinalEl.textContent = finalText;
+        // save to backend
+        saveTranscriptChunk(res[0].transcript.trim());
+      } else {
+        interim += res[0].transcript;
+      }
+    }
+    sttInterimEl.textContent = interim;
+  };
+
+  rec.onerror = (e)=>{
+    console.warn("STT error:", e.error);
+    updateSttStatus("error: "+e.error);
+  };
+
+  rec.onend = ()=>{
+    // Auto-restart to keep it continuous (unless user pressed Stop)
+    if (sttRunning){
+      try { rec.start(); } catch(_) {}
+    } else {
+      updateSttStatus("stopped");
+    }
+  };
+
+  try { rec.start(); } catch(e){ console.error(e); }
+}
+
+function stopSTT(){
+  sttRunning = false;
+  if (rec){
+    try { rec.stop(); } catch(_) {}
+  }
+  document.getElementById("btnSttStart").disabled = false;
+  document.getElementById("btnSttStop").disabled = true;
+  updateSttStatus("stopped");
+}
+
+async function saveTranscriptChunk(text){
+  try{
+    const res = await fetch("http://localhost:8000/save-transcript", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ text, ts: Date.now() })
+    });
+    if (!res.ok) throw new Error(await res.text());
+  }catch(e){
+    console.warn("Failed to save transcript:", e.message);
+  }
+}
+</script>
+</body>
+</html>
