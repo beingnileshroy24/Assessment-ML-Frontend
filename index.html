@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Noise Monitor + Live Transcript</title>
+  <title>Noise Monitor + Recorder</title>
   <style>
     body{font-family:Arial, sans-serif;background:#f7f7f7;padding:30px}
     .container{max-width:640px;margin:auto;background:#fff;padding:20px 30px;border-radius:12px;box-shadow:0 6px 14px rgba(0,0,0,.1)}
@@ -13,15 +13,17 @@
     .value-big{font-size:42px;font-weight:800;margin:6px 0}
     .subtle{color:#666;font-size:13px}
     .bar{width:100%;height:10px;background:#eee;border-radius:999px;overflow:hidden;margin-top:10px}
-    .bar>div{height:100%;width:0%;background:linear-gradient(90deg,#7dd3fc,#60a5fa,#22c55e,#f59e0b,#ef4444);transition:width 120ms linear}
+    .bar>div{height:100%;width:0%;background:linear-gradient(90deg,#7dd3fc,#60a5fa,#22c55e,#22c55e,#f59e0b,#ef4444);transition:width 120ms linear}
     button{padding:10px 14px;font-size:15px;cursor:pointer;border:none;background:#0052cc;color:#fff;border-radius:8px}
+    button.secondary{background:#334155}
+    button.danger{background:#c92a2a}
     button:disabled{background:#999}
     .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
     .section{margin-top:24px}
     .card{background:#fafafa;border:1px solid #eee;border-radius:10px;padding:12px}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
-    .transcript{min-height:120px;white-space:pre-wrap}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef;color:#334}
+    .row-center{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   </style>
 </head>
 <body>
@@ -45,30 +47,73 @@
     <button id="btnStop" disabled>Stop Noise Monitor</button>
   </div>
 
-  <!-- STT UI -->
+  <!-- Recorder UI (auto-tied to monitor) -->
   <div class="section">
-    <h3>🗣️ Live Speech-to-Text</h3>
+    <h3>🎙️ Audio Recorder</h3>
     <div class="card">
-      <div class="subtle">Status: <span id="sttStatus" class="pill">idle</span></div>
-      <div class="btns">
-        <button id="btnSttStart">Start Speech</button>
-        <button id="btnSttStop" disabled>Stop Speech</button>
+      <div class="row-center">
+        <span class="subtle">Status:</span>
+        <span id="recStatus" class="pill">idle</span>
+        <span class="subtle">Elapsed:</span>
+        <span id="recTimer" class="mono">00:00</span>
+        <span class="subtle">Size:</span>
+        <span id="recSize" class="mono">0 KB</span>
       </div>
-      <div class="subtle" style="margin-top:10px">Live (interim):</div>
-      <div id="sttInterim" class="mono transcript"></div>
-      <div class="subtle" style="margin-top:10px">Final transcript (saved):</div>
-      <div id="sttFinal" class="mono transcript"></div>
+
+      <div class="btns">
+        <!-- Manual controls remain available when monitor is OFF -->
+        <button id="recStart">Start Recording</button>
+        <button id="recPause" class="secondary" disabled>Pause</button>
+        <button id="recResume" class="secondary" disabled>Resume</button>
+        <button id="recStop" class="danger" disabled>Stop</button>
+      </div>
+
+      <div class="section">
+        <audio id="recPlayer" controls style="width:100%; display:none;"></audio>
+        <div class="btns" id="recActions" style="display:none;">
+          <a id="recDownload" download="recording.webm">
+            <button class="secondary">Download</button>
+          </a>
+          <!-- We'll wire an Upload button once you share the backend endpoint -->
+          <!-- <button id="recUpload">Upload to Backend</button> -->
+        </div>
+      </div>
+
+      <div class="subtle" style="margin-top:8px">
+        Recording automatically <b>starts</b> with the Noise Monitor and <b>stops</b> when you stop it.
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-/* ===================== Noise Monitor (existing) ===================== */
+/* ===================== Shared state ===================== */
+let sharedStream = null;     // one mic stream for both monitor & recorder
 let ws, audioCtx, processor, source;
+
+let mediaRecorder = null, chunks = [];
+let timerInterval = null;
+let startTimestamp = 0;
+let pausedAccumulated = 0;
+let lastPauseStarted = 0;
+
+const recStatus = document.getElementById("recStatus");
+const recTimer  = document.getElementById("recTimer");
+const recSize   = document.getElementById("recSize");
+const recPlayer = document.getElementById("recPlayer");
+const recActions= document.getElementById("recActions");
+const recDownload = document.getElementById("recDownload");
 
 document.getElementById("btnStart").onclick = startMonitoring;
 document.getElementById("btnStop").onclick = stopMonitoring;
 
+/* Manual recorder buttons (only active when monitor is OFF) */
+document.getElementById("recStart").onclick = manualStartRecording;
+document.getElementById("recPause").onclick = pauseRecording;
+document.getElementById("recResume").onclick = resumeRecording;
+document.getElementById("recStop").onclick = stopRecording;
+
+/* ===================== Noise Monitor ===================== */
 function mapDbfsToLoudness(db){
   const clamped = Math.max(-100, Math.min(0, Number(db)||0));
   return Math.round(100 + clamped);
@@ -78,18 +123,45 @@ async function startMonitoring(){
   try{
     document.getElementById("btnStart").disabled = true;
 
+    // Open WS first
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const host = location.hostname;
     const WS_URL = `${proto}://${host}:8000/ws/monitor`;
     ws = new WebSocket(WS_URL);
 
-    ws.onopen = ()=>{
+    ws.onopen = async ()=>{
       console.log("WS connected:", WS_URL);
       document.getElementById("btnStop").disabled = false;
+
+      // Get or reuse mic
+      if (!sharedStream){
+        sharedStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+      }
+
+      // Audio pipeline to send PCM16 over WS
+      audioCtx = new AudioContext({ sampleRate:16000 });
+      source = audioCtx.createMediaStreamSource(sharedStream);
+      processor = audioCtx.createScriptProcessor(4096,1,1);
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      processor.onaudioprocess = (e)=>{
+        if (!ws || ws.readyState !== 1) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const buf = new ArrayBuffer(input.length * 2);
+        const view = new DataView(buf);
+        for (let i=0;i<input.length;i++){
+          let s = Math.max(-1, Math.min(1, input[i]));
+          view.setInt16(i*2, s<0 ? s*0x8000 : s*0x7FFF, true);
+        }
+        ws.send(buf);
+      };
+
+      // AUTO: start recording with the same stream
+      startRecordingWithStream(sharedStream);
     };
+
     ws.onerror = (e)=>console.error("WS error", e);
     ws.onclose = (e)=>console.warn("WS closed", e.code, e.reason);
-
     ws.onmessage = (event)=>{
       const data = JSON.parse(event.data);
       const db = Number(data.db);
@@ -108,23 +180,9 @@ async function startMonitoring(){
       }
     };
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
-    audioCtx = new AudioContext({ sampleRate:16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096,1,1);
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    processor.onaudioprocess = (e)=>{
-      if (!ws || ws.readyState !== 1) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const buf = new ArrayBuffer(input.length * 2);
-      const view = new DataView(buf);
-      for (let i=0;i<input.length;i++){
-        let s = Math.max(-1, Math.min(1, input[i]));
-        view.setInt16(i*2, s<0 ? s*0x8000 : s*0x7FFF, true);
-      }
-      ws.send(buf);
-    };
+    // Disable manual start while monitor is active
+    document.getElementById("recStart").disabled = true;
+
   }catch(err){
     alert("Noise monitor error: "+err.message);
     document.getElementById("btnStart").disabled = false;
@@ -136,100 +194,140 @@ function stopMonitoring(){
   if (processor) processor.disconnect();
   if (source) source.disconnect();
   if (audioCtx) audioCtx.close();
+
+  // AUTO: stop recording when monitor stops
+  stopRecording();
+
   document.getElementById("btnStart").disabled = false;
   document.getElementById("btnStop").disabled = true;
+
+  // Re-enable manual start (user can record without monitor)
+  document.getElementById("recStart").disabled = false;
+
+  // We intentionally keep sharedStream tracks open so the last recording can still play.
+  // If you prefer to fully release the mic, uncomment:
+  // if (sharedStream) { sharedStream.getTracks().forEach(t => t.stop()); sharedStream = null; }
 }
 
-/* ===================== Browser STT (Web Speech API) ===================== */
-let rec;           // recognition instance
-let sttRunning=false;
-let finalText="";
+/* ===================== Recorder (auto + manual) ===================== */
+function setRecButtons({start, pause, resume, stop}){
+  document.getElementById("recStart").disabled = !start;
+  document.getElementById("recPause").disabled = !pause;
+  document.getElementById("recResume").disabled = !resume;
+  document.getElementById("recStop").disabled = !stop;
+}
 
-const sttStatusEl = document.getElementById("sttStatus");
-const sttInterimEl = document.getElementById("sttInterim");
-const sttFinalEl = document.getElementById("sttFinal");
+function fmtTime(ms){
+  const s = Math.floor(ms/1000);
+  const m = Math.floor(s/60);
+  const r = s % 60;
+  return `${String(m).padStart(2,"0")}:${String(r).padStart(2,"0")}`;
+}
 
-document.getElementById("btnSttStart").onclick = startSTT;
-document.getElementById("btnSttStop").onclick = stopSTT;
+function updateTimer(){
+  const now = Date.now();
+  const effectivePaused = lastPauseStarted ? (now - lastPauseStarted) : 0;
+  const elapsed = now - startTimestamp - pausedAccumulated - effectivePaused;
+  recTimer.textContent = fmtTime(elapsed < 0 ? 0 : elapsed);
+}
 
-function updateSttStatus(text){ sttStatusEl.textContent = text; }
+function initMediaRecorder(stream){
+  // Prefer opus in webm (Chrome/Edge); Safari may use alternate mime types
+  const options = { mimeType: 'audio/webm;codecs=opus' };
+  mediaRecorder = new MediaRecorder(stream, options);
 
-function startSTT(){
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition){
-    alert("Your browser doesn't support SpeechRecognition. Use Chrome/Edge or choose server-side STT.");
+  mediaRecorder.onstart = ()=>{
+    recStatus.textContent = "recording";
+    recPlayer.style.display = "none";
+    recActions.style.display = "none";
+    recSize.textContent = "0 KB";
+    chunks = [];
+    pausedAccumulated = 0;
+    lastPauseStarted = 0;
+    startTimestamp = Date.now();
+    clearInterval(timerInterval);
+    timerInterval = setInterval(updateTimer, 250);
+    setRecButtons({start:false, pause:true, resume:false, stop:true});
+  };
+
+  mediaRecorder.ondataavailable = (e)=>{
+    if (e.data && e.data.size > 0){
+      chunks.push(e.data);
+      const sizeKb = Math.round(chunks.reduce((a,c)=>a+c.size,0)/1024);
+      recSize.textContent = `${sizeKb} KB`;
+    }
+  };
+
+  mediaRecorder.onpause = ()=>{
+    recStatus.textContent = "paused";
+    lastPauseStarted = Date.now();
+    setRecButtons({start:false, pause:false, resume:true, stop:true});
+  };
+
+  mediaRecorder.onresume = ()=>{
+    recStatus.textContent = "recording";
+    if (lastPauseStarted){
+      pausedAccumulated += Date.now() - lastPauseStarted;
+      lastPauseStarted = 0;
+    }
+    setRecButtons({start:false, pause:true, resume:false, stop:true});
+  };
+
+  mediaRecorder.onstop = ()=>{
+    clearInterval(timerInterval);
+    updateTimer();
+    recStatus.textContent = "stopped";
+    setRecButtons({start:true, pause:false, resume:false, stop:false});
+
+    const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+    const url = URL.createObjectURL(blob);
+    recPlayer.src = url;
+    recPlayer.style.display = "block";
+    recActions.style.display = "flex";
+    recDownload.href = url;
+
+    console.log('Recorded blob:', blob.type, blob.size, 'bytes');
+  };
+}
+
+function startRecordingWithStream(stream){
+  if (!mediaRecorder){
+    initMediaRecorder(stream);
+  }
+  if (mediaRecorder.state !== "inactive") {
+    // already recording or paused
     return;
   }
-  rec = new SpeechRecognition();
-  rec.lang = "en-IN";          // set your language (e.g., "en-US", "hi-IN")
-  rec.continuous = true;       // keep listening
-  rec.interimResults = true;   // get interim text quickly
-
-  finalText = "";
-  sttFinalEl.textContent = "";
-  sttInterimEl.textContent = "";
-
-  rec.onstart = ()=>{
-    sttRunning = true;
-    updateSttStatus("listening…");
-    document.getElementById("btnSttStart").disabled = true;
-    document.getElementById("btnSttStop").disabled = false;
-  };
-
-  rec.onresult = (event)=>{
-    let interim = "";
-    for (let i = event.resultIndex; i < event.results.length; i++){
-      const res = event.results[i];
-      if (res.isFinal){
-        // append finalized sentence
-        finalText += (finalText ? " " : "") + res[0].transcript.trim();
-        sttFinalEl.textContent = finalText;
-        // save to backend
-        saveTranscriptChunk(res[0].transcript.trim());
-      } else {
-        interim += res[0].transcript;
-      }
-    }
-    sttInterimEl.textContent = interim;
-  };
-
-  rec.onerror = (e)=>{
-    console.warn("STT error:", e.error);
-    updateSttStatus("error: "+e.error);
-  };
-
-  rec.onend = ()=>{
-    // Auto-restart to keep it continuous (unless user pressed Stop)
-    if (sttRunning){
-      try { rec.start(); } catch(_) {}
-    } else {
-      updateSttStatus("stopped");
-    }
-  };
-
-  try { rec.start(); } catch(e){ console.error(e); }
+  mediaRecorder.start(250); // timeslice for chunking
 }
 
-function stopSTT(){
-  sttRunning = false;
-  if (rec){
-    try { rec.stop(); } catch(_) {}
-  }
-  document.getElementById("btnSttStart").disabled = false;
-  document.getElementById("btnSttStop").disabled = true;
-  updateSttStatus("stopped");
-}
-
-async function saveTranscriptChunk(text){
+async function manualStartRecording(){
   try{
-    const res = await fetch("http://localhost:8000/save-transcript", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ text, ts: Date.now() })
-    });
-    if (!res.ok) throw new Error(await res.text());
-  }catch(e){
-    console.warn("Failed to save transcript:", e.message);
+    if (!sharedStream){
+      sharedStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    startRecordingWithStream(sharedStream);
+  }catch(err){
+    alert("Recorder error: " + err.message);
+    console.error(err);
+  }
+}
+
+function pauseRecording(){
+  if (mediaRecorder && mediaRecorder.state === "recording"){
+    mediaRecorder.pause();
+  }
+}
+
+function resumeRecording(){
+  if (mediaRecorder && mediaRecorder.state === "paused"){
+    mediaRecorder.resume();
+  }
+}
+
+function stopRecording(){
+  if (mediaRecorder && (mediaRecorder.state === "recording" || mediaRecorder.state === "paused")){
+    mediaRecorder.stop();
   }
 }
 </script>
